@@ -9,6 +9,7 @@ use File::Spec;
 use HTTP::Request;
 use HTTP::Request::AsCGI;
 use HTTP::Response;
+use HTTP::Status;
 use IO::Pipe;
 
 our $VERSION = 0.3;
@@ -146,6 +147,56 @@ sub _make_request {
 
     if ( $self->cookie_jar ) {
         $self->cookie_jar->extract_cookies($response);
+    }
+
+    my $code = $response->code;
+
+    if (   $code == HTTP::Status::RC_MOVED_PERMANENTLY
+        or $code == HTTP::Status::RC_FOUND
+        or $code == HTTP::Status::RC_SEE_OTHER
+        or $code == HTTP::Status::RC_TEMPORARY_REDIRECT)
+    {
+        my $referral = $request->clone;
+
+        # These headers should never be forwarded
+        $referral->remove_header('Host', 'Cookie');
+
+        if (   $referral->header('Referer')
+            && $request->uri->scheme eq 'https'
+            && $referral->uri->scheme eq 'http')
+        {
+            # RFC 2616, section 15.1.3.
+            # https -> http redirect, suppressing Referer
+            $referral->remove_header('Referer');
+        }
+
+        if (   $code == HTTP::Status::RC_SEE_OTHER
+            || $code == HTTP::Status::RC_FOUND)
+        {
+            my $method = uc($referral->method);
+            unless ($method eq "GET" || $method eq "HEAD") {
+                $referral->method("GET");
+                $referral->content("");
+                $referral->remove_content_headers;
+            }
+        }
+
+        # And then we update the URL based on the Location:-header.
+        my $referral_uri = $response->header('Location');
+        {
+            # Some servers erroneously return a relative URL for redirects,
+            # so make it absolute if it not already is.
+            local $URI::ABS_ALLOW_RELATIVE_SCHEME = 1;
+            my $base = $response->base;
+            $referral_uri = "" unless defined $referral_uri;
+            $referral_uri
+                = $HTTP::URI_CLASS->new($referral_uri, $base)->abs($base);
+        }
+        $referral->uri($referral_uri);
+
+        if ($self->redirect_ok($referral, $response)) {
+            $response = $self->_make_request($referral);
+        }
     }
 
     return $response;
